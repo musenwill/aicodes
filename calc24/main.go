@@ -63,14 +63,21 @@ func (b BinaryOp) Eval() float64 {
 func (b BinaryOp) String() string { return b.toString(0) }
 
 func (b BinaryOp) toString(parentPrec int) string {
-	if b.Op == "/" {
-		return "(" + b.Left.toString(2) + " / " + b.Right.toString(2) + ")"
-	}
 	myPrec := 1
 	if b.Op == "*" || b.Op == "/" {
 		myPrec = 2
 	}
-	s := fmt.Sprintf("%s %s %s", b.Left.toString(myPrec), b.Op, b.Right.toString(myPrec))
+
+	// For non-associative operators (-, /), the right operand needs a higher
+	// effective parent precedence to force parentheses around same-precedence
+	// sub-expressions. Otherwise e.g. a/(b/c) would render as a/b/c, which
+	// standard left-to-right evaluation interprets as (a/b)/c.
+	rightParentPrec := myPrec
+	if b.Op == "-" || b.Op == "/" {
+		rightParentPrec = myPrec + 1
+	}
+
+	s := fmt.Sprintf("%s %s %s", b.Left.toString(myPrec), b.Op, b.Right.toString(rightParentPrec))
 	if parentPrec > myPrec {
 		return "(" + s + ")"
 	}
@@ -163,6 +170,36 @@ func generateOpCombos() [][]string {
 	return result
 }
 
+// Solve finds all unique 24-point expressions for the given 4 numbers.
+// Each number must be in the range [1, 13]. Results are sorted.
+func Solve(nums []int) []string {
+	perms := generatePermutations(nums)
+	opCombos := generateOpCombos()
+	expressions := make(map[string]bool)
+	for _, perm := range perms {
+		a := Literal(perm[0])
+		b := Literal(perm[1])
+		c := Literal(perm[2])
+		d := Literal(perm[3])
+		for _, combo := range opCombos {
+			for _, tmpl := range templates {
+				expr := tmpl(a, b, c, d, combo[0], combo[1], combo[2])
+				result := expr.Eval()
+				if math.Abs(result-24) < 0.001 {
+					normalized := expr.Normalize()
+					expressions[normalized.String()] = true
+				}
+			}
+		}
+	}
+	var results []string
+	for expr := range expressions {
+		results = append(results, "24 = "+expr)
+	}
+	sort.Strings(results)
+	return results
+}
+
 func main() {
 	var showVersion bool
 	var showHelp bool
@@ -190,6 +227,7 @@ func main() {
 		return
 	}
 
+	// 1. Parse and validate command-line input
 	args := flag.Args()
 	if len(args) != 4 {
 		fmt.Println("Error: exactly 4 numbers required")
@@ -206,30 +244,10 @@ func main() {
 		nums[i] = n
 	}
 
-	perms := generatePermutations(nums)
-	opCombos := generateOpCombos()
-	expressions := make(map[string]bool)
-	for _, perm := range perms {
-		a := Literal(perm[0])
-		b := Literal(perm[1])
-		c := Literal(perm[2])
-		d := Literal(perm[3])
-		for _, combo := range opCombos {
-			for _, tmpl := range templates {
-				expr := tmpl(a, b, c, d, combo[0], combo[1], combo[2])
-				result := expr.Eval()
-				if math.Abs(result-24) < 0.001 {
-					normalized := expr.Normalize()
-					expressions[normalized.String()] = true
-				}
-			}
-		}
-	}
-	var results []string
-	for expr := range expressions {
-		results = append(results, "24 = "+expr)
-	}
-	sort.Strings(results)
+	// 2. Compute 24-point expressions
+	results := Solve(nums)
+
+	// 3. Print results
 	for _, r := range results {
 		fmt.Println(r)
 	}
