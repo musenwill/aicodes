@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -16,48 +15,80 @@ var (
 	tag       = "none"
 )
 
-// Expr represents an expression
+// Rational represents an exact rational number.
+type Rational struct {
+	Num, Den int64
+}
+
+// Is24 reports whether the rational equals 24. Division by zero produces
+// a zero-denominator sentinel that is never equal to 24.
+func (r Rational) Is24() bool { return r.Den != 0 && r.Num == 24*r.Den }
+
+// reduce returns the rational in lowest terms.
+func (r Rational) reduce() Rational {
+	if r.Num == 0 {
+		return Rational{0, 1}
+	}
+	g := gcd(abs64(r.Num), abs64(r.Den))
+	return Rational{r.Num / g, r.Den / g}
+}
+
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func gcd(a, b int64) int64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// Expr represents an expression tree node.
 type Expr interface {
-	Eval() float64
+	Eval() Rational
 	String() string
 	Normalize() Expr
 	toString(parentPrec int) string
 }
 
-// Literal represents a number
-type Literal float64
+// Literal represents a leaf number. All inputs are integers, so Den==1.
+type Literal int64
 
-func (l Literal) Eval() float64 { return float64(l) }
+func (l Literal) Eval() Rational { return Rational{int64(l), 1} }
 
 func (l Literal) String() string { return l.toString(0) }
 
 func (l Literal) Normalize() Expr { return l }
 
-func (l Literal) toString(parentPrec int) string { return fmt.Sprintf("%.0f", float64(l)) }
+func (l Literal) toString(parentPrec int) string { return strconv.FormatInt(int64(l), 10) }
 
-// BinaryOp represents a binary operation
+// BinaryOp represents a binary operation.
 type BinaryOp struct {
 	Op          string
 	Left, Right Expr
 }
 
-func (b BinaryOp) Eval() float64 {
+func (b BinaryOp) Eval() Rational {
 	left := b.Left.Eval()
 	right := b.Right.Eval()
 	switch b.Op {
 	case "+":
-		return left + right
+		return Rational{left.Num*right.Den + right.Num*left.Den, left.Den * right.Den}.reduce()
 	case "-":
-		return left - right
+		return Rational{left.Num*right.Den - right.Num*left.Den, left.Den * right.Den}.reduce()
 	case "*":
-		return left * right
+		return Rational{left.Num * right.Num, left.Den * right.Den}.reduce()
 	case "/":
-		if right == 0 {
-			return math.Inf(1)
+		if right.Num == 0 {
+			return Rational{0, 0} // undefined; filtered out by Is24 check
 		}
-		return left / right
+		return Rational{left.Num * right.Den, left.Den * right.Num}.reduce()
 	}
-	return 0
+	panic("invalid op: " + b.Op)
 }
 
 func (b BinaryOp) String() string { return b.toString(0) }
@@ -132,119 +163,67 @@ func (b BinaryOp) Normalize() Expr {
 		}
 	}
 
-	// Flatten mixed addition/subtraction chains into canonical positive/negative form.
+	// Flatten mixed +/- chains.
 	if b.Op == "+" || b.Op == "-" {
-		pos, neg := flattenAddSub(BinaryOp{Op: b.Op, Left: left, Right: right})
-		sort.Slice(pos, func(i, j int) bool {
-			return pos[i].String() < pos[j].String()
-		})
-		sort.Slice(neg, func(i, j int) bool {
-			return neg[i].String() < neg[j].String()
-		})
-		return buildAddSubChain(pos, neg)
+		pos, neg := flattenWithInverse(BinaryOp{Op: b.Op, Left: left, Right: right}, "+", "-")
+		sort.Slice(pos, func(i, j int) bool { return pos[i].String() < pos[j].String() })
+		sort.Slice(neg, func(i, j int) bool { return neg[i].String() < neg[j].String() })
+		return buildChainWithInverse(pos, neg, "+", "-")
 	}
 
-	// Flatten mixed multiplication/division chains into canonical numerator/denominator form.
+	// Flatten mixed */ chains.
 	if b.Op == "*" || b.Op == "/" {
-		nums, dens := flattenMultDiv(BinaryOp{Op: b.Op, Left: left, Right: right})
-		sort.Slice(nums, func(i, j int) bool {
-			return nums[i].String() < nums[j].String()
-		})
-		sort.Slice(dens, func(i, j int) bool {
-			return dens[i].String() < dens[j].String()
-		})
-		return buildMultDivChain(nums, dens)
+		nums, dens := flattenWithInverse(BinaryOp{Op: b.Op, Left: left, Right: right}, "*", "/")
+		sort.Slice(nums, func(i, j int) bool { return nums[i].String() < nums[j].String() })
+		sort.Slice(dens, func(i, j int) bool { return dens[i].String() < dens[j].String() })
+		return buildChainWithInverse(nums, dens, "*", "/")
 	}
 
-	return BinaryOp{Op: b.Op, Left: left, Right: right}
+	panic("invalid op: " + b.Op)
 }
 
-// flattenAddSub recursively collects positive and negative operands from a
-// mixed chain of + and - operators. For a - node, the right child's role flips:
-// positives become negatives and vice versa (negation effect).
-func flattenAddSub(expr Expr) (pos []Expr, neg []Expr) {
+// flattenWithInverse collects operands from a chain of directOp and inverseOp.
+// For an inverseOp node, the right child's operands swap categories (e.g. for "-",
+// right positives become negatives and vice versa; for "/", right numerators become
+// denominators and vice versa).
+func flattenWithInverse(expr Expr, directOp, inverseOp string) (direct []Expr, inverse []Expr) {
 	if b, ok := expr.(BinaryOp); ok {
-		if b.Op == "+" {
-			lp, ln := flattenAddSub(b.Left)
-			rp, rn := flattenAddSub(b.Right)
-			return append(lp, rp...), append(ln, rn...)
+		if b.Op == directOp {
+			ld, li := flattenWithInverse(b.Left, directOp, inverseOp)
+			rd, ri := flattenWithInverse(b.Right, directOp, inverseOp)
+			return append(ld, rd...), append(li, ri...)
 		}
-		if b.Op == "-" {
-			lp, ln := flattenAddSub(b.Left)
-			rp, rn := flattenAddSub(b.Right)
-			// right side: positives become negatives, negatives become positives
-			return append(lp, rn...), append(ln, rp...)
+		if b.Op == inverseOp {
+			ld, li := flattenWithInverse(b.Left, directOp, inverseOp)
+			rd, ri := flattenWithInverse(b.Right, directOp, inverseOp)
+			return append(ld, ri...), append(li, rd...)
 		}
 	}
 	return []Expr{expr}, nil
 }
 
-// buildAddSubChain builds a left-associative tree from positive and negative
-// operand lists: first all positives via +, then subtract each negative via -.
-// For example, buildAddSubChain([a,b], [c,d]) → (((a+b)-c)-d).
-func buildAddSubChain(pos []Expr, neg []Expr) Expr {
-	if len(pos) == 0 && len(neg) == 0 {
+// buildChainWithInverse builds a left-associative tree: all direct operands via
+// directOp, then each inverse operand via inverseOp.
+func buildChainWithInverse(direct, inverse []Expr, directOp, inverseOp string) Expr {
+	if len(direct) == 0 && len(inverse) == 0 {
 		return Literal(0)
 	}
-
 	var result Expr
-	if len(pos) > 0 {
-		result = pos[0]
-		for i := 1; i < len(pos); i++ {
-			result = BinaryOp{Op: "+", Left: result, Right: pos[i]}
+	if len(direct) > 0 {
+		result = direct[0]
+		for i := 1; i < len(direct); i++ {
+			result = BinaryOp{Op: directOp, Left: result, Right: direct[i]}
 		}
 	} else {
-		// only negatives: start with 0 - ...
-		result = Literal(0)
-	}
-
-	for _, n := range neg {
-		result = BinaryOp{Op: "-", Left: result, Right: n}
-	}
-	return result
-}
-
-// flattenMultDiv recursively collects numerator and denominator operands from a
-// mixed chain of * and / operators. For a / node, the right child's role flips:
-// numerators become denominators and vice versa (reciprocal effect).
-func flattenMultDiv(expr Expr) (nums []Expr, dens []Expr) {
-	if b, ok := expr.(BinaryOp); ok {
-		if b.Op == "*" {
-			ln, ld := flattenMultDiv(b.Left)
-			rn, rd := flattenMultDiv(b.Right)
-			return append(ln, rn...), append(ld, rd...)
-		}
-		if b.Op == "/" {
-			ln, ld := flattenMultDiv(b.Left)
-			rn, rd := flattenMultDiv(b.Right)
-			// right side: numerators become denominators, denominators become numerators
-			return append(ln, rd...), append(ld, rn...)
+		// identity element: 0 for +/-, 1 for */
+		if directOp == "+" {
+			result = Literal(0)
+		} else {
+			result = Literal(1)
 		}
 	}
-	return []Expr{expr}, nil
-}
-
-// buildMultDivChain builds a left-associative tree from numerator and denominator
-// lists: first all numerators via *, then divide by each denominator via /.
-// For example, buildMultDivChain([a,b,c], [d]) → (((a*b)*c)/d).
-func buildMultDivChain(nums []Expr, dens []Expr) Expr {
-	if len(nums) == 0 && len(dens) == 0 {
-		return Literal(0)
-	}
-
-	var result Expr
-	if len(nums) > 0 {
-		result = nums[0]
-		for i := 1; i < len(nums); i++ {
-			result = BinaryOp{Op: "*", Left: result, Right: nums[i]}
-		}
-	} else {
-		// only denominators: start with 1 / ...
-		result = Literal(1)
-	}
-
-	for _, d := range dens {
-		result = BinaryOp{Op: "/", Left: result, Right: d}
+	for _, inv := range inverse {
+		result = BinaryOp{Op: inverseOp, Left: result, Right: inv}
 	}
 	return result
 }
@@ -335,8 +314,7 @@ func Solve(nums []int) []string {
 		for _, combo := range opCombos {
 			for _, tmpl := range templates {
 				expr := tmpl(a, b, c, d, combo[0], combo[1], combo[2])
-				result := expr.Eval()
-				if math.Abs(result-24) < 0.001 {
+				if result := expr.Eval(); result.Is24() {
 					normalized := expr.Normalize()
 					expressions[normalized.String()] = true
 				}

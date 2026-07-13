@@ -44,12 +44,23 @@ func runCase(t *testing.T, input []int, expected []string) {
 }
 
 func TestNoSolution(t *testing.T) {
+	runCase(t, []int{1, 1, 1, 1}, []string{})
+	runCase(t, []int{2, 2, 2, 2}, []string{})
 	runCase(t, []int{7, 7, 7, 7}, []string{})
 	runCase(t, []int{8, 8, 8, 8}, []string{})
 	runCase(t, []int{9, 9, 9, 9}, []string{})
+	runCase(t, []int{13, 13, 13, 13}, []string{})
 }
 
 func TestSingleSolution(t *testing.T) {
+	runCase(t, []int{1, 1, 1, 8}, []string{
+		"24 = (1 + 1 + 1) * 8",
+	})
+
+	runCase(t, []int{1, 2, 7, 7}, []string{
+		"24 = (7 * 7 - 1) / 2",
+	})
+
 	runCase(t, []int{1, 2, 9, 11}, []string{
 		"24 = (1 + 2) * 11 - 9",
 	})
@@ -66,8 +77,16 @@ func TestSingleSolution(t *testing.T) {
 		"24 = (11 * 11 - 1) / 5",
 	})
 
+	runCase(t, []int{1, 7, 13, 13}, []string{
+		"24 = (13 * 13 - 1) / 7",
+	})
+
 	runCase(t, []int{2, 5, 6, 9}, []string{
 		"24 = 5 * 6 / 2 + 9",
+	})
+
+	runCase(t, []int{2, 7, 7, 10}, []string{
+		"24 = (10 / 7 + 2) * 7",
 	})
 
 	runCase(t, []int{3, 3, 3, 3}, []string{
