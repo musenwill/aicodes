@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -20,12 +21,18 @@ type Rational struct {
 	Num, Den int64
 }
 
-// Is24 reports whether the rational equals 24. Division by zero produces
-// a zero-denominator sentinel that is never equal to 24.
+// Is24 reports whether the rational equals 24. Division by zero produces a
+// zero-denominator sentinel {0, 0}. The sentinel is absorbing: any operation
+// involving it stays undefined, so an expression with an undefined
+// subexpression never evaluates to 24.
 func (r Rational) Is24() bool { return r.Den != 0 && r.Num == 24*r.Den }
 
-// reduce returns the rational in lowest terms.
+// reduce returns the rational in lowest terms. An undefined rational
+// (zero denominator) is returned unchanged so the sentinel propagates.
 func (r Rational) reduce() Rational {
+	if r.Den == 0 {
+		return r
+	}
 	if r.Num == 0 {
 		return Rational{0, 1}
 	}
@@ -205,9 +212,6 @@ func flattenWithInverse(expr Expr, directOp, inverseOp string) (direct []Expr, i
 // buildChainWithInverse builds a left-associative tree: all direct operands via
 // directOp, then each inverse operand via inverseOp.
 func buildChainWithInverse(direct, inverse []Expr, directOp, inverseOp string) Expr {
-	if len(direct) == 0 && len(inverse) == 0 {
-		return Literal(0)
-	}
 	var result Expr
 	if len(direct) > 0 {
 		result = direct[0]
@@ -215,7 +219,8 @@ func buildChainWithInverse(direct, inverse []Expr, directOp, inverseOp string) E
 			result = BinaryOp{Op: directOp, Left: result, Right: direct[i]}
 		}
 	} else {
-		// identity element: 0 for +/-, 1 for */
+		// identity element: 0 for +/-, 1 for */ (defensive; a chain built
+		// from real inputs always has at least one direct operand)
 		if directOp == "+" {
 			result = Literal(0)
 		} else {
@@ -329,55 +334,64 @@ func Solve(nums []int) []string {
 	return results
 }
 
-func main() {
+// run parses args, solves, and writes the results. It returns the process
+// exit code: 0 on success, 1 for invalid input, 2 for malformed flags.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("calc24", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var showVersion bool
 	var showHelp bool
-	flag.BoolVar(&showVersion, "V", false, "show version")
-	flag.BoolVar(&showVersion, "version", false, "show version")
-	flag.BoolVar(&showHelp, "h", false, "show help")
-	flag.BoolVar(&showHelp, "help", false, "show help")
-	flag.Parse()
+	fs.BoolVar(&showVersion, "V", false, "show version")
+	fs.BoolVar(&showVersion, "version", false, "show version")
+	fs.BoolVar(&showHelp, "h", false, "show help")
+	fs.BoolVar(&showHelp, "help", false, "show help")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	if showHelp {
-		fmt.Println("Usage: calc24 <num1> <num2> <num3> <num4>")
-		fmt.Println("Calculate 24-point expressions using four numbers.")
-		fmt.Println("Each number must be an integer between 1 and 13.")
-		flag.PrintDefaults()
-		return
+		fmt.Fprintln(stdout, "Usage: calc24 <num1> <num2> <num3> <num4>")
+		fmt.Fprintln(stdout, "Calculate 24-point expressions using four numbers.")
+		fmt.Fprintln(stdout, "Each number must be an integer between 1 and 13.")
+		fs.SetOutput(stdout) // defaults belong with the help text
+		fs.PrintDefaults()
+		return 0
 	}
 
 	if showVersion {
-		fmt.Printf("calc24 version %s\n", version)
-		fmt.Printf("Commit: %s\n", commit)
-		fmt.Printf("Built: %s\n", buildTime)
+		fmt.Fprintf(stdout, "calc24 version %s\n", version)
+		fmt.Fprintf(stdout, "Commit: %s\n", commit)
+		fmt.Fprintf(stdout, "Built: %s\n", buildTime)
 		if tag != "none" {
-			fmt.Printf("Tag: %s\n", tag)
+			fmt.Fprintf(stdout, "Tag: %s\n", tag)
 		}
-		return
+		return 0
 	}
 
 	// 1. Parse and validate command-line input
-	args := flag.Args()
-	if len(args) != 4 {
-		fmt.Println("Error: exactly 4 numbers required")
-		os.Exit(1)
+	rest := fs.Args()
+	if len(rest) != 4 {
+		fmt.Fprintln(stderr, "Error: exactly 4 numbers required")
+		return 1
 	}
 
 	nums := make([]int, 4)
-	for i, arg := range args {
+	for i, arg := range rest {
 		n, err := strconv.Atoi(arg)
 		if err != nil || n < 1 || n > 13 {
-			fmt.Printf("Error: %s is not a valid number (1-13)\n", arg)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Error: %s is not a valid number (1-13)\n", arg)
+			return 1
 		}
 		nums[i] = n
 	}
 
-	// 2. Compute 24-point expressions
-	results := Solve(nums)
-
-	// 3. Print results
-	for _, r := range results {
-		fmt.Println(r)
+	// 2. Compute 24-point expressions and print them
+	for _, r := range Solve(nums) {
+		fmt.Fprintln(stdout, r)
 	}
+	return 0
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
