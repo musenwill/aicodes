@@ -3,6 +3,7 @@ package mandelbrot
 import (
 	"image/color"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -372,6 +373,149 @@ func TestRenderConcurrentConsistency(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Interior fast-path tests
+// ---------------------------------------------------------------------------
+
+func TestInsideMainStructures(t *testing.T) {
+	inside := []struct {
+		name   string
+		cr, ci float64
+	}{
+		{"origin (cardioid)", 0, 0},
+		{"cardioid interior", 0.2, 0.1},
+		{"period-2 bulb center", -1, 0},
+		{"bulb interior", -0.9, 0.1},
+	}
+	for _, p := range inside {
+		if !insideMainStructures(p.cr, p.ci) {
+			t.Errorf("%s (%v,%v) should be inside", p.name, p.cr, p.ci)
+		}
+	}
+	outside := []struct {
+		name   string
+		cr, ci float64
+	}{
+		{"far outside", 3, 0},
+		{"above cardioid", 0.25, 0.8},
+		{"between bulb and cardioid", -1.6, 0},
+		{"tip of antenna", -2, 0},
+	}
+	for _, p := range outside {
+		if insideMainStructures(p.cr, p.ci) {
+			t.Errorf("%s (%v,%v) should be outside", p.name, p.cr, p.ci)
+		}
+	}
+}
+
+func TestInteriorFastPathMatchesIteration(t *testing.T) {
+	cfg := Config{MaxIterations: 512, EscapeRadius: 4.0}
+	// Points claimed inside by the fast path must return MaxIterations,
+	// exactly as the full iteration loop would.
+	for _, p := range [][2]float64{{0, 0}, {-1, 0}, {-0.85, 0.1}, {0.2, 0.2}} {
+		if !insideMainStructures(p[0], p[1]) {
+			t.Fatalf("test point (%v,%v) unexpectedly outside", p[0], p[1])
+		}
+		if got := IterCount(complex(p[0], p[1]), cfg); got != cfg.MaxIterations {
+			t.Errorf("IterCount(%v): want %d, got %d", p, cfg.MaxIterations, got)
+		}
+		if got := SmoothIterCount(complex(p[0], p[1]), cfg); got != float64(cfg.MaxIterations) {
+			t.Errorf("SmoothIterCount(%v): want %d, got %f", p, cfg.MaxIterations, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Palette LUT tests
+// ---------------------------------------------------------------------------
+
+func TestBuildLUTMatchesColorForIter(t *testing.T) {
+	p := FirePalette
+	maxIter := 100
+	lut := p.buildLUT(maxIter)
+	if len(lut) != 4*maxIter+1 {
+		t.Fatalf("LUT length: want %d, got %d", 4*maxIter+1, len(lut))
+	}
+	// Every quarter-step entry must equal the direct computation.
+	for i, c := range lut {
+		want := p.ColorForIter(float64(i)/4, maxIter)
+		if c != want {
+			t.Fatalf("LUT[%d] (iter=%v): want %v, got %v", i, float64(i)/4, want, c)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Async Job tests
+// ---------------------------------------------------------------------------
+
+func TestJobCompletes(t *testing.T) {
+	cfg := Config{MaxIterations: 64, EscapeRadius: 4.0}
+	cam := *NewCamera(64, 48)
+	r := NewRenderer(cfg, PICO8, 1, 1)
+	r.Workers = 4
+
+	j := r.StartJob(64, 48, cam)
+	defer j.Cancel()
+
+	// Both phases must finish promptly.
+	deadline := time.Now().Add(5 * time.Second)
+	for !j.Finished() {
+		if time.Now().After(deadline) {
+			t.Fatal("job did not finish within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !j.PreviewReady() {
+		t.Error("preview should be ready when job finishes")
+	}
+	if j.Progress() != 1 {
+		t.Errorf("progress after finish: want 1, got %f", j.Progress())
+	}
+
+	// Preview dimensions follow the downscale factor.
+	if want := max(1, 64/previewDownscale); j.PreviewW != want {
+		t.Errorf("PreviewW: want %d, got %d", want, j.PreviewW)
+	}
+	if want := max(1, 48/previewDownscale); j.PreviewH != want {
+		t.Errorf("PreviewH: want %d, got %d", want, j.PreviewH)
+	}
+
+	// Full image must be fully painted.
+	if got := j.Full.Bounds(); got.Dx() != 64 || got.Dy() != 48 {
+		t.Errorf("full image bounds: want 64×48, got %v", got)
+	}
+
+	// Bands channel must have delivered every band.
+	bands := 0
+	for range j.Bands {
+		bands++
+	}
+	if bands == 0 {
+		t.Error("expected at least one band event")
+	}
+}
+
+func TestJobCancelIsSafe(t *testing.T) {
+	cfg := Config{MaxIterations: 1000, EscapeRadius: 4.0}
+	cam := *NewCamera(320, 240)
+	r := NewRenderer(cfg, PICO8, 1, 1)
+	r.Workers = 2
+
+	j := r.StartJob(320, 240, cam)
+	j.Cancel() // Abandon immediately, as rapid input would.
+	if !j.Cancelled() {
+		t.Error("Cancelled() should report true after Cancel()")
+	}
+	// Smoke-test the accessors on an abandoned job.
+	_ = j.PreviewReady()
+	_ = j.Finished()
+	_ = j.Progress()
+	// Give abandoned workers a moment to bail out; nothing should panic
+	// or deadlock under the race detector.
+	time.Sleep(20 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------

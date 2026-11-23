@@ -36,7 +36,7 @@ var PICO8 = Palette{
 
 // FirePalette generates a fire-like gradient: black → red → orange → yellow → white.
 var FirePalette = Palette{
-	Name:   "Fire",
+	Name: "Fire",
 	Colors: buildGradient([]colorStop{
 		{0.00, color.RGBA{0, 0, 0, 255}},
 		{0.25, color.RGBA{89, 0, 0, 255}},
@@ -49,7 +49,7 @@ var FirePalette = Palette{
 
 // BlueFire generates a cyan/blue gradient.
 var BlueFire = Palette{
-	Name:   "BlueFire",
+	Name: "BlueFire",
 	Colors: buildGradient([]colorStop{
 		{0.00, color.RGBA{0, 0, 32, 255}},
 		{0.25, color.RGBA{0, 40, 100, 255}},
@@ -62,7 +62,7 @@ var BlueFire = Palette{
 
 // Twilight creates a deep purple → gold gradient.
 var Twilight = Palette{
-	Name:   "Twilight",
+	Name: "Twilight",
 	Colors: buildGradient([]colorStop{
 		{0.00, color.RGBA{10, 5, 30, 255}},
 		{0.30, color.RGBA{60, 20, 100, 255}},
@@ -149,4 +149,17 @@ func (p Palette) ColorForIter(iter float64, maxIterations int) color.RGBA {
 	idx = math.Sqrt(idx*float64(len(p.Colors))) / math.Sqrt(float64(len(p.Colors))) * float64(len(p.Colors))
 	i := int(idx) % len(p.Colors)
 	return p.Colors[i]
+}
+
+// buildLUT precomputes a quarter-step color lookup table covering the smooth
+// iteration range [0, maxIterations]. The render hot loop then replaces all
+// per-pixel palette math (division, sqrt, modulo) with one indexed read.
+// Index with int(mu*4); values agree with ColorForIter to within ¼ iteration,
+// which is invisible after color quantization.
+func (p Palette) buildLUT(maxIterations int) []color.RGBA {
+	lut := make([]color.RGBA, 4*maxIterations+1)
+	for i := range lut {
+		lut[i] = p.ColorForIter(float64(i)/4, maxIterations)
+	}
+	return lut
 }

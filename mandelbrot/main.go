@@ -1,6 +1,6 @@
 // Mandelbrot Set Explorer — an interactive GUI for exploring the
 // Mandelbrot set. Supports mouse-wheel zoom, configurable iteration precision,
-// multiple color palettes, and parallel tile-based rendering.
+// multiple color palettes, and asynchronous progressive rendering.
 //
 // Usage:
 //
@@ -8,18 +8,17 @@
 //
 // Flags:
 //
-//	-iter N     Maximum iterations (1–10000, default 256)
-//	-palette S  Color palette: PICO-8, Fire, BlueFire, Twilight (default Fire)
-//	-rows N     Tile grid rows for parallel rendering (default 0 = auto)
-//	-cols N     Tile grid columns for parallel rendering (default 0 = auto)
+//	-iter N      Maximum iterations (1–10000, default 256)
+//	-palette S   Color palette: PICO-8, Fire, BlueFire, Twilight (default Fire)
+//	-workers N   Render worker goroutines (0 = auto: NumCPU)
 package main
 
 import (
 	"flag"
 	"fmt"
 	"image"
-	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -27,15 +26,16 @@ import (
 	"mandelbrot/mandelbrot"
 )
 
+// jobRestartDelay throttles how often a new render job may start. During
+// rapid input (wheel scrolling) the previous frame, warped to the current
+// view, provides instant feedback, so jobs only need to start this often.
+const jobRestartDelay = 100 * time.Millisecond
+
 // Game implements ebiten.Game and drives the Mandelbrot explorer.
 type Game struct {
 	cam      *mandelbrot.Camera
 	renderer *mandelbrot.Renderer
 	cfg      mandelbrot.Config
-
-	// Cached ebiten image for the current view.
-	cachedImg  *ebiten.Image
-	needsRedraw bool
 
 	// Current palette index.
 	paletteIdx int
@@ -44,28 +44,39 @@ type Game struct {
 	// Screen dimensions (updated on Layout).
 	scrW, scrH int
 
+	// Asynchronous render pipeline.
+	job        *mandelbrot.Job // In-flight render, nil when idle.
+	viewDirty  bool            // View changed; a new job should start soon.
+	lastStart  time.Time       // Last job start, for throttling.
+	prevUpload bool            // Current job's preview was uploaded already.
+
+	texFull *ebiten.Image // Full-res texture; finished bands are uploaded as they arrive.
+	texOld  *ebiten.Image // Last completed frame, warped during interaction.
+	texPrev *ebiten.Image // Low-res preview texture.
+
+	frameCam      mandelbrot.Camera // Camera of the completed frame in texOld/texFull.
+	frameCamValid bool
+
 	// FPS counter state.
 	frameCount int
 	fps        int
 }
 
 // NewGame creates a Game with the given configuration.
-func NewGame(cfg mandelbrot.Config, paletteName string, rows, cols int) *Game {
-	if rows <= 0 || cols <= 0 {
-		rows = runtime.NumCPU()
-		cols = runtime.NumCPU()
-	}
-
+func NewGame(cfg mandelbrot.Config, paletteName string, workers int) *Game {
 	palettes := mandelbrot.BuiltinPalettes
 	pIdx := paletteIndex(palettes, paletteName)
 
+	r := mandelbrot.NewRenderer(cfg, palettes[pIdx], 1, 1)
+	r.Workers = workers
+
 	return &Game{
-		cam:         nil, // Initialized on first Layout.
-		cfg:         cfg,
-		renderer:    mandelbrot.NewRenderer(cfg, palettes[pIdx], rows, cols),
-		palettes:    palettes,
-		paletteIdx:  pIdx,
-		needsRedraw: true,
+		cam:        nil, // Initialized on first Layout.
+		cfg:        cfg,
+		renderer:   r,
+		palettes:   palettes,
+		paletteIdx: pIdx,
+		viewDirty:  true,
 	}
 }
 
@@ -89,12 +100,15 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	if g.scrW != outsideWidth || g.scrH != outsideHeight {
 		g.scrW = outsideWidth
 		g.scrH = outsideHeight
-		g.needsRedraw = true
 		if g.cam == nil {
 			g.cam = mandelbrot.NewCamera(outsideWidth, outsideHeight)
 		} else {
 			g.cam.AspectRatio = float64(outsideWidth) / float64(outsideHeight)
 		}
+		// Textures must match the new size; drop everything and re-render.
+		g.texFull, g.texOld, g.texPrev = nil, nil, nil
+		g.frameCamValid = false
+		g.viewChanged()
 	}
 	return outsideWidth, outsideHeight
 }
@@ -109,7 +123,7 @@ func (g *Game) Update() error {
 	// --- Reset view ---
 	if inpututil.IsKeyJustPressed(ebiten.KeyR) {
 		g.cam.Reset(g.scrW, g.scrH)
-		g.needsRedraw = true
+		g.viewChanged()
 		return nil
 	}
 
@@ -125,12 +139,12 @@ func (g *Game) Update() error {
 	if inpututil.IsKeyJustPressed(ebiten.KeyLeft) {
 		g.paletteIdx = (g.paletteIdx - 1 + len(g.palettes)) % len(g.palettes)
 		g.renderer.Palette = g.palettes[g.paletteIdx]
-		g.needsRedraw = true
+		g.viewChanged()
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyRight) {
 		g.paletteIdx = (g.paletteIdx + 1) % len(g.palettes)
 		g.renderer.Palette = g.palettes[g.paletteIdx]
-		g.needsRedraw = true
+		g.viewChanged()
 	}
 
 	// --- Mouse wheel zoom ---
@@ -145,8 +159,11 @@ func (g *Game) Update() error {
 			factor = 1.25 // Zoom out.
 		}
 		g.cam.ZoomAt(factor, mx, my, g.scrW, g.scrH)
-		g.needsRedraw = true
+		g.viewChanged()
 	}
+
+	// --- Start a throttled render job if the view is stale ---
+	g.maybeStartJob()
 
 	// --- FPS tracking ---
 	g.frameCount++
@@ -154,41 +171,148 @@ func (g *Game) Update() error {
 	return nil
 }
 
-// Draw renders the Mandelbrot set to the screen. Re-computation only occurs
-// when the view parameters have changed (dirty flag).
+// Draw composites the render pipeline every frame: the warped previous
+// frame for instant feedback, the low-res preview once it lands, and
+// finished full-resolution bands revealed incrementally on top.
 func (g *Game) Draw(screen *ebiten.Image) {
-	if g.needsRedraw || g.cachedImg == nil {
-		g.recompute()
+	switch {
+	case g.job == nil && g.frameCamValid:
+		// Steady state: the completed frame.
+		screen.DrawImage(g.texFull, &ebiten.DrawImageOptions{})
+
+	case g.job != nil:
+		// Transitional: previous frame warped to the current view.
+		if g.frameCamValid {
+			screen.DrawImage(g.texOld, g.warpGeoM())
+		}
+		// Low-res preview replaces the warp as soon as it is ready.
+		if g.job.PreviewReady() && !g.prevUpload {
+			g.uploadPreview()
+			g.prevUpload = true
+		}
+		if g.prevUpload {
+			op := &ebiten.DrawImageOptions{}
+			op.GeoM.Scale(float64(g.scrW)/float64(g.job.PreviewW),
+				float64(g.scrH)/float64(g.job.PreviewH))
+			screen.DrawImage(g.texPrev, op)
+		}
+		// Reveal finished full-res bands over the preview.
+		g.drainBands(screen)
+		if g.job.Finished() {
+			g.frameCam = g.job.Cam
+			g.frameCamValid = true
+			// Snapshot the completed frame as the next warp source.
+			g.texOld.DrawImage(g.texFull, &ebiten.DrawImageOptions{})
+			screen.DrawImage(g.texFull, &ebiten.DrawImageOptions{})
+			g.job = nil
+		}
 	}
+	// Default (startup, no job yet): background only; preview appears shortly.
 
-	op := &ebiten.DrawImageOptions{}
-	screen.DrawImage(g.cachedImg, op)
-
-	// Draw a simple HUD overlay.
 	g.drawHUD(screen)
 }
 
-// recompute re-renders the Mandelbrot set using the parallel tile renderer
-// and uploads the result to the GPU as an ebiten image.
-func (g *Game) recompute() {
-	if g.scrW <= 0 || g.scrH <= 0 {
-		return
+// viewChanged cancels any in-flight render and marks the view stale.
+func (g *Game) viewChanged() {
+	if g.job != nil {
+		g.job.Cancel()
+		g.job = nil
 	}
-	img := g.renderer.Render(g.scrW, g.scrH, g.cam)
-	g.cachedImg = ebiten.NewImageFromImage(img)
-	g.needsRedraw = false
+	g.viewDirty = true
 }
 
-// drawHUD renders a minimal status line showing zoom, iterations, and palette.
+// maybeStartJob starts a render job for a stale view, throttled by
+// jobRestartDelay so rapid input does not churn jobs.
+func (g *Game) maybeStartJob() {
+	if !g.viewDirty || g.scrW <= 0 || g.scrH <= 0 {
+		return
+	}
+	if time.Since(g.lastStart) < jobRestartDelay {
+		return
+	}
+	g.ensureTextures()
+	g.job = g.renderer.StartJob(g.scrW, g.scrH, *g.cam)
+	g.prevUpload = false
+	g.viewDirty = false
+	g.lastStart = time.Now()
+}
+
+// ensureTextures (re)creates the GPU textures for the current screen size.
+func (g *Game) ensureTextures() {
+	if g.texFull != nil && g.texOld != nil &&
+		g.texFull.Bounds().Dx() == g.scrW && g.texFull.Bounds().Dy() == g.scrH {
+		return
+	}
+	g.texFull = ebiten.NewImage(g.scrW, g.scrH)
+	g.texOld = ebiten.NewImage(g.scrW, g.scrH)
+	g.texPrev = nil // Recreated on preview upload.
+	g.frameCamValid = false
+}
+
+// uploadPreview uploads the job's low-res preview into texPrev.
+func (g *Game) uploadPreview() {
+	pw, ph := g.job.PreviewW, g.job.PreviewH
+	if g.texPrev == nil || g.texPrev.Bounds().Dx() != pw || g.texPrev.Bounds().Dy() != ph {
+		g.texPrev = ebiten.NewImage(pw, ph)
+	}
+	g.texPrev.WritePixels(g.job.Preview.Pix)
+}
+
+// drainBands uploads every full-res band finished since the last frame to
+// the GPU and draws the refreshed regions over the preview. SubImage scopes
+// WritePixels to just the band's rows.
+func (g *Game) drainBands(screen *ebiten.Image) {
+	stride := g.job.Full.Stride
+	for {
+		select {
+		case b, ok := <-g.job.Bands:
+			if !ok {
+				return // Channel closed: job finished, nothing more to drain.
+			}
+			pixels := g.job.Full.Pix[b.Y0*stride : b.Y1*stride]
+			sub := g.texFull.SubImage(image.Rect(0, b.Y0, g.scrW, b.Y1)).(*ebiten.Image)
+			sub.WritePixels(pixels)
+			screen.DrawImage(sub, &ebiten.DrawImageOptions{})
+		default:
+			return
+		}
+	}
+}
+
+// warpGeoM builds the transform that maps the completed frame (rendered for
+// frameCam) onto the current view, so zooming shows an aligned stretch of
+// the old image while the new one computes.
+//
+// Derived from p' = ((c - centerNew)/viewNew)·size + size/2 with
+// c = centerOld + ((p/size) - 1/2)·viewOld, giving p' = p·s + B with
+// s = viewOld/viewNew and B = size·((centerOld-centerNew)/viewNew + 1/2 - s/2).
+func (g *Game) warpGeoM() *ebiten.DrawImageOptions {
+	old := g.frameCam
+	vwNew := g.cam.ViewWidth()
+	vhNew := g.cam.ViewHeight()
+	sx := old.ViewWidth() / vwNew
+	sy := old.ViewHeight() / vhNew
+	op := &ebiten.DrawImageOptions{}
+	op.GeoM.Scale(sx, sy)
+	op.GeoM.Translate(
+		float64(g.scrW)*((old.CenterX-g.cam.CenterX)/vwNew+0.5-0.5*sx),
+		float64(g.scrH)*((old.CenterY-g.cam.CenterY)/vhNew+0.5-0.5*sy),
+	)
+	return op
+}
+
+// drawHUD reports zoom, iterations, palette and render progress via the
+// window title, keeping the display unobstructed.
 func (g *Game) drawHUD(screen *ebiten.Image) {
-	// Ebitengine doesn't have built-in text rendering, so we use a minimal
-	// approach: the window title is updated in Draw with current info.
-	// This keeps the display unobstructed.
 	if g.frameCount%30 == 0 {
 		g.fps = int(ebiten.ActualFPS())
 	}
-	title := fmt.Sprintf("Mandelbrot | Zoom: %.2e | Iter: %d | Palette: %s | FPS: %d",
-		g.cam.Zoom, g.cfg.MaxIterations, g.palettes[g.paletteIdx].Name, g.fps)
+	status := ""
+	if g.job != nil {
+		status = fmt.Sprintf(" | Rendering: %d%%", int(g.job.Progress()*100))
+	}
+	title := fmt.Sprintf("Mandelbrot | Zoom: %.2e | Iter: %d | Palette: %s | FPS: %d%s",
+		g.cam.Zoom, g.cfg.MaxIterations, g.palettes[g.paletteIdx].Name, g.fps, status)
 	ebiten.SetWindowTitle(title)
 }
 
@@ -213,7 +337,7 @@ func (g *Game) adjustIterations(delta int) {
 	if newVal != g.cfg.MaxIterations {
 		g.cfg.MaxIterations = newVal
 		g.renderer.Config.MaxIterations = newVal
-		g.needsRedraw = true
+		g.viewChanged()
 	}
 }
 
@@ -225,14 +349,13 @@ func main() {
 	// Parse flags.
 	iter := flag.Int("iter", 256, "Maximum iterations (1–10000)")
 	paletteName := flag.String("palette", "Fire", "Color palette: PICO-8, Fire, BlueFire, Twilight")
-	rows := flag.Int("rows", 0, "Tile grid rows (0 = auto: NumCPU)")
-	cols := flag.Int("cols", 0, "Tile grid cols (0 = auto: NumCPU)")
+	workers := flag.Int("workers", 0, "Render worker goroutines (0 = auto: NumCPU)")
 	flag.Parse()
 
 	// Best-effort parse of extra os.Args that have no leading dash,
 	// allowing positional args like "mandelbrot iter=1000 palette=BlueFire".
 	for _, a := range flag.Args() {
-		parseExtraArg(a, iter, paletteName, rows, cols)
+		parseExtraArg(a, iter, paletteName, workers)
 	}
 
 	// Build config.
@@ -250,7 +373,7 @@ func main() {
 	sw, sh := ebiten.ScreenSizeInFullscreen()
 	ebiten.SetWindowSize(sw, sh)
 
-	game := NewGame(cfg, *paletteName, *rows, *cols)
+	game := NewGame(cfg, *paletteName, *workers)
 
 	if err := ebiten.RunGame(game); err != nil {
 		// Normal exit via Escape terminates with an error; suppress it.
@@ -262,7 +385,7 @@ func main() {
 }
 
 // parseExtraArg handles key=value positional arguments.
-func parseExtraArg(a string, iter *int, paletteName *string, rows, cols *int) {
+func parseExtraArg(a string, iter *int, paletteName *string, workers *int) {
 	// Quick manual split to avoid importing strings for a minor feature.
 	eq := -1
 	for i := 0; i < len(a); i++ {
@@ -282,13 +405,9 @@ func parseExtraArg(a string, iter *int, paletteName *string, rows, cols *int) {
 		}
 	case "palette":
 		*paletteName = val
-	case "rows":
+	case "workers":
 		if v, err := strconv.Atoi(val); err == nil {
-			*rows = v
-		}
-	case "cols":
-		if v, err := strconv.Atoi(val); err == nil {
-			*cols = v
+			*workers = v
 		}
 	}
 }

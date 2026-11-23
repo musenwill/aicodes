@@ -87,5 +87,4 @@ help:
 	@echo "Flags:"
 	@echo "  -iter N           Max iterations (1–10000, default 256)"
 	@echo "  -palette S        Palette: PICO-8, Fire, BlueFire, Twilight"
-	@echo "  -rows N           Tile grid rows (0 = auto)"
-	@echo "  -cols N           Tile grid cols (0 = auto)"
+	@echo "  -workers N        Render worker goroutines (0 = auto: NumCPU)"

@@ -11,10 +11,15 @@ mouse-wheel zoom.
 
 - **Fullscreen only** — immersive fractal exploration.
 - **Mouse-wheel zoom** — zoom in/out at cursor position for precise navigation.
+- **Non-blocking progressive rendering** — rendering never stalls the UI: while a new
+  frame computes in the background, the previous frame is warped to the current view,
+  a low-resolution preview appears within milliseconds, and finished bands are revealed
+  incrementally on top.
 - **Configurable iteration precision** — from 1 up to 10,000 iterations.
 - **Multiple color palettes** — PICO-8, Fire, BlueFire, and Twilight gradients.
-- **Parallel rendering** — the screen is divided into an M×N tile grid; each tile is
-  computed in a separate goroutine, fully utilizing multi-core CPUs.
+- **Parallel rendering** — a pool of worker goroutines renders dynamically scheduled
+  horizontal bands (≈4× worker count), so slow boundary bands and fast sky bands
+  balance themselves via work stealing.
 - **Smooth coloring** — continuous iteration count for gradient-free color transitions.
 
 ## Prerequisites
@@ -64,7 +69,7 @@ make run
 
 ```bash
 make run  # or:
-./build/mandelbrot -iter 1000 -palette BlueFire -rows 6 -cols 6
+./build/mandelbrot -iter 1000 -palette BlueFire -workers 8
 ```
 
 ## Controls
@@ -100,8 +105,8 @@ mandelbrot/
 │   ├── mandelbrot.go               # Core Mandelbrot computation (escape-time algorithm)
 │   ├── mandelbrot_test.go          # Unit tests and benchmarks
 │   ├── camera.go                   # View state: complex-plane mapping and zoom
-│   ├── palette.go                  # Color palettes and gradient interpolation
-│   └── renderer.go                 # Parallel tile-based image renderer
+│   ├── palette.go                  # Color palettes, gradient interpolation, LUT
+│   └── renderer.go                 # Parallel band renderer + async progressive Job
 ├── Makefile                         # Build / test / clean automation
 ├── go.mod
 ├── go.sum
@@ -133,13 +138,31 @@ where `n` is the discrete escape iteration, `|zₙ|` the magnitude at escape, an
 
 ### Parallel Rendering
 
-1. The screen is divided into `rows × cols` rectangular tiles.
-2. Each tile is dispatched to a goroutine.
-3. Goroutines compute independently — no shared state, no synchronization needed.
-4. A final pass assembles all tile results into a single RGBA image.
-5. The image is uploaded to the GPU as an ebiten texture and drawn to the screen.
+1. The image is split into horizontal bands — roughly `4 × workers`, far more than
+   there are goroutines — queued on an atomic cursor.
+2. Each worker goroutine claims the next band, computes it, and moves on: fast
+   bands (sky) and slow bands (set boundary) balance themselves dynamically.
+3. Workers write RGBA pixels directly into the shared output buffer (disjoint rows,
+   no locks, no intermediate tile copies).
+4. Per-pixel work is kept lean: precomputed complex-plane stepping (no divisions in
+   the hot loop), an interior fast path for the main cardioid and period-2 bulb,
+   plain `float64` arithmetic, and a quarter-step palette lookup table.
 
-This achieves linear speedup with core count for the rendering step.
+This achieves near-linear speedup with core count for the rendering step.
+
+### Asynchronous Progressive Pipeline
+
+`Renderer.StartJob` returns a `Job` that streams results without blocking the UI:
+
+1. Workers first render a **1/8-scale preview** cooperatively — it lands within
+   milliseconds and is upscaled to fill the screen.
+2. They then fill the **full-resolution image** band by band, delivering each
+   finished band on a channel; the UI uploads it to the GPU (`WritePixels`) and
+   reveals it over the preview the same frame.
+3. While a job runs, the **previous completed frame is warped** (scaled and
+   translated) to the current camera, so zooming always shows an aligned image.
+4. New input cancels the in-flight job; restarts are throttled to 100 ms because
+   the warped frame already tracks the cursor exactly.
 
 ### Camera
 
