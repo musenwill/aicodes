@@ -47,7 +47,8 @@ make clean      # 清理构建产物
 make test
 ```
 
-覆盖洗牌有解性、相邻判定、计步、过关判定、计时冻结、重开重置等逻辑。
+覆盖两种规模的洗牌有解性、相邻判定、格子边长、点击命中与边界、计步、
+过关判定（含补 9/16）、规模切换重置、计时冻结、配色与按钮布局。
 
 ## 开发辅助
 
@@ -65,5 +66,6 @@ PUZZLE_SIZE=4 PUZZLE_DUMP=/tmp/shot4.png make run
 main.go       游戏全部实现（棋盘、洗牌、动画、状态栏、字体加载）
 main_test.go  逻辑单元测试
 Makefile      构建脚本（Linux / Windows 双平台）
+.gitignore    忽略构建产物
 dist/         构建产物输出目录
 ```
