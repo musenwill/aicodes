@@ -130,6 +130,13 @@ func (g *Game) Update() error {
 		return ebiten.Termination
 	}
 
+	// 保证窗口大小完全固定：X11 的 min/max 尺寸提示已由 main 中的
+	// WindowResizingModeDisabled 设置，但 WSLg 等窗口管理器会忽略提示、
+	// 仍允许拖拽改变窗口大小，这里一旦发现实际尺寸偏离立即拉回。
+	if w, h := ebiten.WindowSize(); w != screenWidth || h != screenHeight {
+		ebiten.SetWindowSize(screenWidth, screenHeight)
+	}
+
 	// 推进平移动画：时间到则落定、计步并判断是否过关。
 	if g.anim != nil && time.Since(g.anim.startTime) >= animTime {
 		g.finishAnim()
