@@ -1,8 +1,10 @@
-// puzzle 是一个基于 ebiten 的 3x3 数字华容道（8-puzzle）小游戏。
+// puzzle 是一个基于 ebiten 的数字华容道（sliding puzzle）小游戏，
+// 支持 3x3 与 4x4 两种规模。
 //
 // 玩法：点击与空格上下左右相邻的方块，方块会平移滑入空格；
-// 将数字 1~8 按从左到右、从上到下的顺序排好（空格位于右下角）即过关，
-// 过关后右下角自动补上数字 9。
+// 将数字 1~n²-1 按从左到右、从上到下的顺序排好（空格位于右下角）即过关，
+// 过关后右下角自动补上数字 n²（9 或 16）。底部状态栏可通过
+// [3x3] / [4x4] 按钮随时开一局对应规模的新游戏。
 package main
 
 import (
@@ -25,12 +27,10 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
-// 窗口与布局常量：游戏区固定 300x300（每格 100x100），底部状态栏 40，
-// 窗口整体 300x340，大小固定不可调整。
+// 窗口与布局常量：游戏区固定 300x300（3x3 每格 100，4x4 每格 75），
+// 底部状态栏 40，窗口整体 300x340，大小固定不可调整。
 const (
-	gridN        = 3
-	cellSize     = 100
-	boardSize    = gridN * cellSize // 300
+	boardSize    = 300
 	barHeight    = 40
 	screenWidth  = boardSize
 	screenHeight = boardSize + barHeight // 340
@@ -38,8 +38,8 @@ const (
 	tileMargin = 4                      // 方块与格子边缘的留白
 	animTime   = 120 * time.Millisecond // 方块平移动画时长
 
-	tileFontSize = 46
-	uiFontSize   = 15
+	tileFontRatio = 0.46 // 方块数字字号 = 格子边长 × 该比例
+	uiFontSize    = 15
 )
 
 var (
@@ -52,29 +52,27 @@ var (
 	btnHotColor = color.RGBA{0x46, 0x92, 0xe6, 0xff}
 )
 
-// tileColors 是数字 1~9 的方块底色（蓝→青渐变；9 为过关时补上的方块，用绿色）。
-var tileColors = [10]color.RGBA{
-	{},
-	{0x2f, 0x6d, 0xb3, 0xff},
-	{0x2e, 0x74, 0xad, 0xff},
-	{0x2d, 0x7a, 0xa7, 0xff},
-	{0x2d, 0x81, 0xa1, 0xff},
-	{0x2c, 0x88, 0x9c, 0xff},
-	{0x2b, 0x8f, 0x96, 0xff},
-	{0x2a, 0x95, 0x90, 0xff},
-	{0x29, 0x9c, 0x8a, 0xff},
-	{0x2f, 0x9e, 0x6b, 0xff},
-}
+// 方块底色渐变端点：数字 1 为蓝，最大数字（8 或 15）为青；
+// winTileColor 是过关时补上的最后一块（9 或 16）的绿色。
+var (
+	gradientStart = color.RGBA{0x2f, 0x6d, 0xb3, 0xff}
+	gradientEnd   = color.RGBA{0x29, 0x9c, 0x8a, 0xff}
+	winTileColor  = color.RGBA{0x2f, 0x9e, 0x6b, 0xff}
+)
 
-// buttonRect 是状态栏中 [再来一局] 按钮的区域。
-var buttonRect = image.Rect(screenWidth-98, boardSize+6, screenWidth-8, boardSize+barHeight-6)
+// 状态栏右侧的规模按钮区域：点击对应按钮开一局该规模的新游戏。
+var (
+	button3Rect = image.Rect(188, boardSize+6, 236, boardSize+barHeight-6)
+	button4Rect = image.Rect(244, boardSize+6, 292, boardSize+barHeight-6)
+)
 
 // Game 实现 ebiten.Game 接口。
 type Game struct {
-	board     [gridN * gridN]int // 0 表示空格，1~9 表示方块上的数字
-	moves     int                // 本局已平移的步数
-	startTime time.Time          // 本局开始时间
-	endTime   time.Time          // 过关时刻（用于冻结计时）
+	n         int       // 棋盘规模：3 或 4
+	board     []int     // 长度 n²；0 表示空格，1~n² 表示方块上的数字
+	moves     int       // 本局已平移的步数
+	startTime time.Time // 本局开始时间
+	endTime   time.Time // 过关时刻（用于冻结计时）
 	won       bool
 	anim      *slideAnim // 当前平移动画，nil 表示空闲
 
@@ -103,13 +101,27 @@ func main() {
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeDisabled)
 
 	g := &Game{}
-	g.restart()
+	g.restart(startSize())
 	g.dumpFile = os.Getenv("PUZZLE_DUMP")
 	if g.dumpFile != "" {
 		g.dumpAt = time.Now().Add(1500 * time.Millisecond)
 	}
 	if err := ebiten.RunGame(g); err != nil && !errors.Is(err, ebiten.Termination) {
 		log.Fatal(err)
+	}
+}
+
+// startSize 解析启动规模：默认 3x3；开发/验证可用 PUZZLE_SIZE=4 指定。
+func startSize() int {
+	switch s := os.Getenv("PUZZLE_SIZE"); s {
+	case "":
+		return 3
+	case "3", "4":
+		v, _ := strconv.Atoi(s)
+		return v
+	default:
+		log.Printf("忽略无效的 PUZZLE_SIZE=%q（仅支持 3 或 4），默认 3x3", s)
+		return 3
 	}
 }
 
@@ -128,9 +140,14 @@ func (g *Game) Update() error {
 	}
 	x, y := ebiten.CursorPosition()
 
-	// [再来一局] 按钮：任何时候（含动画中、过关后）都可以点击。
-	if image.Pt(x, y).In(buttonRect) {
-		g.restart()
+	// 规模按钮：任何时候（含动画中、过关后）都可以点击，
+	// 点击即开一局对应规模的新游戏（对当前规模而言相当于再来一局）。
+	if image.Pt(x, y).In(button3Rect) {
+		g.restart(3)
+		return nil
+	}
+	if image.Pt(x, y).In(button4Rect) {
+		g.restart(4)
 		return nil
 	}
 
@@ -138,11 +155,12 @@ func (g *Game) Update() error {
 	if g.anim != nil || g.won || y >= boardSize {
 		return nil
 	}
-	idx := (y/cellSize)*gridN + x/cellSize
+	c := g.cellSize()
+	idx := (y/c)*g.n + x/c
 	if g.board[idx] == 0 {
 		return nil
 	}
-	if blank := g.blankIndex(); adjacent(idx, blank) {
+	if blank := g.blankIndex(); adjacent(idx, blank, g.n) {
 		g.anim = &slideAnim{
 			tile:      g.board[idx],
 			from:      idx,
@@ -154,11 +172,14 @@ func (g *Game) Update() error {
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
+	screen.Fill(bgColor)
+
 	// 棋盘底格
-	for i := 0; i < gridN*gridN; i++ {
-		x, y := cellPos(i)
+	c := g.cellSize()
+	for i := 0; i < g.n*g.n; i++ {
+		x, y := g.cellPos(i)
 		vector.DrawFilledRect(screen, float32(x)+2, float32(y)+2,
-			cellSize-4, cellSize-4, cellColor, false)
+			float32(c-4), float32(c-4), cellColor, false)
 	}
 
 	// 方块（正在平移的方块画在插值位置上）
@@ -166,15 +187,15 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		if v == 0 {
 			continue
 		}
-		x, y := cellPos(i)
+		x, y := g.cellPos(i)
 		fx, fy := float32(x), float32(y)
 		if g.anim != nil && g.anim.from == i {
-			tx, ty := cellPos(g.anim.to)
+			tx, ty := g.cellPos(g.anim.to)
 			p := easeOut(float64(time.Since(g.anim.startTime)) / float64(animTime))
 			fx += float32(p) * float32(tx-x)
 			fy += float32(p) * float32(ty-y)
 		}
-		drawTile(screen, fx, fy, v)
+		g.drawTile(screen, fx, fy, v)
 	}
 
 	g.drawStatusBar(screen)
@@ -209,6 +230,16 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return screenWidth, screenHeight
 }
 
+// cellSize 返回当前规模下每个格子的边长（3x3 → 100，4x4 → 75）。
+func (g *Game) cellSize() int {
+	return boardSize / g.n
+}
+
+func (g *Game) cellPos(i int) (x, y int) {
+	c := g.cellSize()
+	return (i % g.n) * c, (i / g.n) * c
+}
+
 // finishAnim 落定当前平移动画：更新棋盘、计步并判断是否过关。
 func (g *Game) finishAnim() {
 	g.board[g.anim.to] = g.anim.tile
@@ -218,26 +249,25 @@ func (g *Game) finishAnim() {
 	g.checkWin()
 }
 
-// restart 开始一局新游戏：重新洗牌并重置步数与计时。
-func (g *Game) restart() {
-	g.board = shuffledBoard()
+// restart 开始一局 n x n 规模的新游戏：重新洗牌并重置步数与计时。
+func (g *Game) restart(n int) {
+	g.n = n
+	g.board = shuffledBoard(n)
 	g.moves = 0
 	g.startTime = time.Now()
 	g.won = false
 	g.anim = nil
 }
 
-// checkWin 判断过关：1~8 按序排列（此时空格必然已在右下角）。
-// 过关后冻结计时，并自动在右下角补上数字 9 的方块。
+// checkWin 判断过关：1~n²-1 按序排列（此时空格必然已在右下角）。
+// 过关后冻结计时，并自动在右下角补上数字 n² 的方块。
 func (g *Game) checkWin() {
-	for i := 0; i < gridN*gridN-1; i++ {
-		if g.board[i] != i+1 {
-			return
-		}
+	if !isSolved(g.board) {
+		return
 	}
 	g.won = true
 	g.endTime = time.Now()
-	g.board[gridN*gridN-1] = 9
+	g.board[len(g.board)-1] = g.n * g.n
 }
 
 // elapsed 返回本局已进行的时间；过关后冻结在过关那一刻。
@@ -257,7 +287,7 @@ func (g *Game) blankIndex() int {
 	return -1 // 不会发生：棋盘上恒有一个空格
 }
 
-// drawStatusBar 绘制底部状态栏：步数、耗时与 [再来一局] 按钮。
+// drawStatusBar 绘制底部状态栏：步数、耗时与 [3x3] / [4x4] 规模按钮。
 func (g *Game) drawStatusBar(screen *ebiten.Image) {
 	vector.DrawFilledRect(screen, 0, boardSize, screenWidth, barHeight, barColor, false)
 	vector.DrawFilledRect(screen, 0, boardSize, screenWidth, 2, sepColor, false)
@@ -265,34 +295,56 @@ func (g *Game) drawStatusBar(screen *ebiten.Image) {
 	msg := fmt.Sprintf("步数 %d   时间 %ds", g.moves, int(g.elapsed().Seconds()))
 	drawTextLeft(screen, msg, uiFace, 10, boardSize+barHeight/2, textColor)
 
-	// 按钮：悬停时高亮
+	drawButton(screen, button3Rect, "3x3")
+	drawButton(screen, button4Rect, "4x4")
+}
+
+// drawButton 绘制一个小按钮，鼠标悬停时高亮。
+func drawButton(screen *ebiten.Image, r image.Rectangle, label string) {
 	mx, my := ebiten.CursorPosition()
 	c := btnColor
-	if image.Pt(mx, my).In(buttonRect) {
+	if image.Pt(mx, my).In(r) {
 		c = btnHotColor
 	}
-	vector.DrawFilledRect(screen, float32(buttonRect.Min.X), float32(buttonRect.Min.Y),
-		float32(buttonRect.Dx()), float32(buttonRect.Dy()), c, true)
-	drawTextCenter(screen, "再来一局", uiFace,
-		float64(buttonRect.Min.X+buttonRect.Dx()/2),
-		float64(buttonRect.Min.Y+buttonRect.Dy()/2), color.White)
+	vector.DrawFilledRect(screen, float32(r.Min.X), float32(r.Min.Y),
+		float32(r.Dx()), float32(r.Dy()), c, true)
+	drawTextCenter(screen, label, uiFace,
+		float64(r.Min.X+r.Dx()/2), float64(r.Min.Y+r.Dy()/2), color.White)
 }
 
 // drawTile 在 (x, y)（所在格子的左上角）绘制数字为 v 的方块。
-func drawTile(screen *ebiten.Image, x, y float32, v int) {
-	w := float32(cellSize - 2*tileMargin)
-	c := tileColors[v]
-	vector.DrawFilledRect(screen, x+tileMargin, y+tileMargin, w, w, c, true)
-	vector.StrokeRect(screen, x+tileMargin, y+tileMargin, w, w, 2, dimColor(c), true)
-	drawTextCenter(screen, strconv.Itoa(v), tileFace,
-		float64(x+cellSize/2), float64(y+cellSize/2), color.White)
+func (g *Game) drawTile(screen *ebiten.Image, x, y float32, v int) {
+	c := g.cellSize()
+	w := float32(c - 2*tileMargin)
+	col := tileColor(g.n, v)
+	vector.DrawFilledRect(screen, x+tileMargin, y+tileMargin, w, w, col, true)
+	vector.StrokeRect(screen, x+tileMargin, y+tileMargin, w, w, 2, dimColor(col), true)
+	drawTextCenter(screen, strconv.Itoa(v), tileFaces[g.n],
+		float64(x)+float64(c)/2, float64(y)+float64(c)/2, color.White)
 }
 
-// shuffledBoard 生成一局新棋盘：空格固定在右下角，数字 1~8 随机分布在
-// 其余 8 格。为保证每局都有解，要求随机排列的逆序数为偶数（3x3 奇数宽
-// 棋盘的可解性只取决于逆序数奇偶）；同时排除开局即已过关的排列。
-func shuffledBoard() [gridN * gridN]int {
-	nums := make([]int, gridN*gridN-1)
+// tileColor 返回规模 n 下数字 v 方块的底色：1~n²-1 沿蓝→青线性渐变，
+// 过关时补上的最后一块 n² 用绿色。
+func tileColor(n, v int) color.RGBA {
+	if v == n*n {
+		return winTileColor
+	}
+	t := float64(v-1) / float64(n*n-2)
+	return color.RGBA{
+		lerp(gradientStart.R, gradientEnd.R, t),
+		lerp(gradientStart.G, gradientEnd.G, t),
+		lerp(gradientStart.B, gradientEnd.B, t),
+		0xff,
+	}
+}
+
+// shuffledBoard 生成一局 n x n 的新棋盘：空格固定在右下角，数字
+// 1~n²-1 随机分布在其余格。为保证每局都有解，要求随机排列的逆序数为
+// 偶数——由于空格初始位于最后一行，这一判据对 3x3 和 4x4 都成立
+// （4x4 的完整判据还与空格所在行有关，空格在最后一行时退化为偶逆序）。
+// 同时排除开局即已过关的排列。
+func shuffledBoard(n int) []int {
+	nums := make([]int, n*n-1)
 	for i := range nums {
 		nums[i] = i + 1
 	}
@@ -303,21 +355,24 @@ func shuffledBoard() [gridN * gridN]int {
 		if inversions(nums)%2 != 0 {
 			continue
 		}
-		var b [gridN * gridN]int
-		copy(b[:], nums)
-		if b == solvedBoard() {
+		b := make([]int, n*n)
+		copy(b, nums)
+		if isSolved(b) {
 			continue
 		}
 		return b
 	}
 }
 
-func solvedBoard() [gridN * gridN]int {
-	var b [gridN * gridN]int
-	for i := 0; i < gridN*gridN-1; i++ {
-		b[i] = i + 1
+// isSolved 判断棋盘是否处于过关局面：前 n²-1 格依次为 1~n²-1，
+// 空格在最后一格。
+func isSolved(b []int) bool {
+	for i := 0; i < len(b)-1; i++ {
+		if b[i] != i+1 {
+			return false
+		}
 	}
-	return b
+	return b[len(b)-1] == 0
 }
 
 // inversions 统计排列中的逆序对个数。
@@ -333,9 +388,9 @@ func inversions(nums []int) int {
 	return n
 }
 
-// adjacent 判断两个格子的下标是否上下左右相邻。
-func adjacent(a, b int) bool {
-	return abs(a%gridN-b%gridN)+abs(a/gridN-b/gridN) == 1
+// adjacent 判断 n x n 棋盘上两个格子的下标是否上下左右相邻。
+func adjacent(a, b, n int) bool {
+	return abs(a%n-b%n)+abs(a/n-b/n) == 1
 }
 
 func abs(x int) int {
@@ -345,16 +400,16 @@ func abs(x int) int {
 	return x
 }
 
-func cellPos(i int) (x, y int) {
-	return (i % gridN) * cellSize, (i / gridN) * cellSize
-}
-
 // easeOut 是先快后慢的二次缓动，让平移动画更自然。
 func easeOut(p float64) float64 {
 	if p > 1 {
 		p = 1
 	}
 	return 1 - (1-p)*(1-p)
+}
+
+func lerp(a, b uint8, t float64) uint8 {
+	return uint8(float64(a) + (float64(b)-float64(a))*t + 0.5)
 }
 
 func dimColor(c color.RGBA) color.RGBA {
@@ -382,8 +437,8 @@ func drawTextLeft(dst *ebiten.Image, s string, face textv2.Face, x, cy float64, 
 }
 
 var (
-	tileFace *textv2.GoTextFace // 方块数字（粗体）
-	uiFace   *textv2.GoTextFace // 状态栏文本（常规）
+	tileFaces map[int]*textv2.GoTextFace // 各规模的方块数字 face（粗体）
+	uiFace    *textv2.GoTextFace         // 状态栏文本（常规）
 )
 
 // 候选字体文件按优先级排列：方块数字用 Bold、界面文本用 Regular，
@@ -419,7 +474,10 @@ func loadFonts() error {
 		return fmt.Errorf("未找到可用的中文字体（Bold 候选 %v；Regular 候选 %v）",
 			boldFontCandidates, regularFontCandidates)
 	}
-	tileFace = &textv2.GoTextFace{Source: tileSrc, Size: tileFontSize}
+	tileFaces = map[int]*textv2.GoTextFace{
+		3: {Source: tileSrc, Size: tileFontRatio * float64(boardSize/3)},
+		4: {Source: tileSrc, Size: tileFontRatio * float64(boardSize/4)},
+	}
 	uiFace = &textv2.GoTextFace{Source: uiSrc, Size: uiFontSize}
 	return nil
 }
