@@ -54,6 +54,30 @@ func gcd(a, b int64) int64 {
 	return a
 }
 
+// Add returns the exact sum r + o, reduced.
+func (r Rational) Add(o Rational) Rational {
+	return Rational{r.Num*o.Den + o.Num*r.Den, r.Den * o.Den}.reduce()
+}
+
+// Sub returns the exact difference r - o, reduced.
+func (r Rational) Sub(o Rational) Rational {
+	return Rational{r.Num*o.Den - o.Num*r.Den, r.Den * o.Den}.reduce()
+}
+
+// Mul returns the exact product r * o, reduced.
+func (r Rational) Mul(o Rational) Rational {
+	return Rational{r.Num * o.Num, r.Den * o.Den}.reduce()
+}
+
+// Div returns the exact quotient r / o, reduced. Division by zero
+// (o.Num == 0) produces the undefined sentinel {0, 0}; Is24 filters it.
+func (r Rational) Div(o Rational) Rational {
+	if o.Num == 0 {
+		return Rational{0, 0}
+	}
+	return Rational{r.Num * o.Den, r.Den * o.Num}.reduce()
+}
+
 // Expr represents an expression tree node.
 type Expr interface {
 	Eval() Rational
@@ -84,16 +108,13 @@ func (b BinaryOp) Eval() Rational {
 	right := b.Right.Eval()
 	switch b.Op {
 	case "+":
-		return Rational{left.Num*right.Den + right.Num*left.Den, left.Den * right.Den}.reduce()
+		return left.Add(right)
 	case "-":
-		return Rational{left.Num*right.Den - right.Num*left.Den, left.Den * right.Den}.reduce()
+		return left.Sub(right)
 	case "*":
-		return Rational{left.Num * right.Num, left.Den * right.Den}.reduce()
+		return left.Mul(right)
 	case "/":
-		if right.Num == 0 {
-			return Rational{0, 0} // undefined; filtered out by Is24 check
-		}
-		return Rational{left.Num * right.Den, left.Den * right.Num}.reduce()
+		return left.Div(right)
 	}
 	panic("invalid op: " + b.Op)
 }
@@ -122,55 +143,20 @@ func (b BinaryOp) toString(parentPrec int) string {
 	return s
 }
 
+// Normalize canonicalizes an expression tree for deduplication. It assumes
+// the expression is fully defined (no division by zero anywhere): Solve
+// only normalizes expressions that evaluated to 24, and since the
+// zero-denominator sentinel is absorbing, such expressions cannot contain
+// an undefined subexpression. On undefined input the flatten transforms
+// may change the value (a / (b / 0) → a * 0 / b), which is out of scope.
 func (b BinaryOp) Normalize() Expr {
 	left := b.Left.Normalize()
 	right := b.Right.Normalize()
 
-	// Push negation inward to eliminate nested inverse operators.
-	if b.Op == "-" {
-		if rightBin, ok := right.(BinaryOp); ok {
-			if rightBin.Op == "+" {
-				// a - (b + c) → (a - b) - c
-				return BinaryOp{
-					Op:    "-",
-					Left:  BinaryOp{Op: "-", Left: left, Right: rightBin.Left},
-					Right: rightBin.Right,
-				}.Normalize()
-			}
-			if rightBin.Op == "-" {
-				// a - (b - c) → (a - b) + c
-				return BinaryOp{
-					Op:    "+",
-					Left:  BinaryOp{Op: "-", Left: left, Right: rightBin.Left},
-					Right: rightBin.Right,
-				}.Normalize()
-			}
-		}
-	}
-
-	// Push reciprocal inward.
-	if b.Op == "/" {
-		if rightBin, ok := right.(BinaryOp); ok {
-			if rightBin.Op == "*" {
-				// a / (b * c) → (a / b) / c
-				return BinaryOp{
-					Op:    "/",
-					Left:  BinaryOp{Op: "/", Left: left, Right: rightBin.Left},
-					Right: rightBin.Right,
-				}.Normalize()
-			}
-			if rightBin.Op == "/" {
-				// a / (b / c) → (a / b) * c
-				return BinaryOp{
-					Op:    "*",
-					Left:  BinaryOp{Op: "/", Left: left, Right: rightBin.Left},
-					Right: rightBin.Right,
-				}.Normalize()
-			}
-		}
-	}
-
-	// Flatten mixed +/- chains.
+	// Flatten mixed +/- chains. Flattening crosses the right operand of a
+	// '-' node (operand categories swap), which subsumes the inverse
+	// identities a-(b+c) = a-b-c and a-(b-c) = a-b+c, so no separate
+	// operator-pushdown pass is needed.
 	if b.Op == "+" || b.Op == "-" {
 		pos, neg := flattenWithInverse(BinaryOp{Op: b.Op, Left: left, Right: right}, "+", "-")
 		sort.Slice(pos, func(i, j int) bool { return pos[i].String() < pos[j].String() })
@@ -178,7 +164,9 @@ func (b BinaryOp) Normalize() Expr {
 		return buildChainWithInverse(pos, neg, "+", "-")
 	}
 
-	// Flatten mixed */ chains.
+	// Flatten mixed */ chains. Crossing the right operand of a '/' node
+	// (numerator/denominator swap) subsumes a/(b*c) = a/b/c and
+	// a/(b/c) = a/b*c.
 	if b.Op == "*" || b.Op == "/" {
 		nums, dens := flattenWithInverse(BinaryOp{Op: b.Op, Left: left, Right: right}, "*", "/")
 		sort.Slice(nums, func(i, j int) bool { return nums[i].String() < nums[j].String() })
@@ -260,6 +248,9 @@ var templates = []func(Expr, Expr, Expr, Expr, string, string, string) Expr{
 
 var ops = []string{"+", "-", "*", "/"}
 
+// opCombos holds all 64 combinations of 3 operators (4³), generated once.
+var opCombos = generateOpCombos()
+
 // generatePermutations generates all unique permutations of nums
 func generatePermutations(nums []int) [][]int {
 	var result [][]int
@@ -309,7 +300,6 @@ func generateOpCombos() [][]string {
 // Each number must be in the range [1, 13]. Results are sorted.
 func Solve(nums []int) []string {
 	perms := generatePermutations(nums)
-	opCombos := generateOpCombos()
 	expressions := make(map[string]bool)
 	for _, perm := range perms {
 		a := Literal(perm[0])
